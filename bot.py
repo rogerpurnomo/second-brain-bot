@@ -46,15 +46,15 @@ from telegram.ext import (
 # Config (all from environment — see .env.example)
 # --------------------------------------------------------------------------- #
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]          # "username/vault-repo"
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 
-# Groq (OpenAI-compatible). Override the model via GROQ_MODEL if it's retired.
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Gemini via its OpenAI-compatible endpoint. Override the model if it's retired.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GITHUB_API = "https://api.github.com"
 
 logging.basicConfig(
@@ -226,21 +226,21 @@ async def load_recent_ideas(max_ideas: int = 8) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# LLM brain (Groq — OpenAI-compatible chat completions, direct HTTP)
+# LLM brain (Gemini — OpenAI-compatible chat completions, direct HTTP)
 # --------------------------------------------------------------------------- #
 async def call_llm(messages: list[dict], system: str, max_tokens: int = 1024) -> str:
     payload = {
-        "model": GROQ_MODEL,
+        "model": GEMINI_MODEL,
         "max_tokens": max_tokens,
         # OpenAI-style: system prompt is the first message in the list
         "messages": [{"role": "system", "content": system}, *messages],
     }
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {GEMINI_API_KEY}",
         "content-type": "application/json",
     }
     async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(GROQ_URL, headers=headers, json=payload)
+        resp = await client.post(GEMINI_URL, headers=headers, json=payload)
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"]

@@ -26,19 +26,19 @@ Test, 🚀 Next Steps, or 📥 Quick Save), chat with Claude, then tap 💾 Save
 | Layer        | Tool                          |
 | ------------ | ----------------------------- |
 | Bot          | Telegram (python-telegram-bot)|
-| Brain        | Groq API (`llama-3.3-70b-versatile`, free tier) |
+| Brain        | Gemini API (`gemini-2.0-flash`, free tier) |
 | Vault sync   | GitHub private repo (REST API)|
 | Hosting      | Railway.app                   |
 
 ## Environment variables
 
 See `.env.example`. All are required except `GITHUB_BRANCH` (defaults `main`)
-and `GROQ_MODEL` (defaults `llama-3.3-70b-versatile`).
+and `GEMINI_MODEL` (defaults `gemini-2.0-flash`).
 
 | Var                | Where to get it                                      |
 | ------------------ | ---------------------------------------------------- |
 | `TELEGRAM_TOKEN`   | @BotFather → /newbot                                 |
-| `GROQ_API_KEY`     | console.groq.com → API Keys (free)                   |
+| `GEMINI_API_KEY`   | aistudio.google.com/apikey (free)                    |
 | `GITHUB_TOKEN`     | GitHub → fine-grained PAT, Contents read/write       |
 | `GITHUB_REPO`      | `yourusername/vault-repo-name`                       |
 | `GITHUB_BRANCH`    | usually `main`                                       |
