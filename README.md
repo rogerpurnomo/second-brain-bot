@@ -26,14 +26,14 @@ Test, 🚀 Next Steps, or 📥 Quick Save), chat with Claude, then tap 💾 Save
 | Layer        | Tool                          |
 | ------------ | ----------------------------- |
 | Bot          | Telegram (python-telegram-bot)|
-| Brain        | Gemini API (`gemini-2.0-flash`, free tier) |
+| Brain        | Gemini API (`gemini-2.5-flash`, free tier) |
 | Vault sync   | GitHub private repo (REST API)|
 | Hosting      | Railway.app                   |
 
 ## Environment variables
 
 See `.env.example`. All are required except `GITHUB_BRANCH` (defaults `main`)
-and `GEMINI_MODEL` (defaults `gemini-2.0-flash`).
+and `GEMINI_MODEL` (defaults `gemini-2.5-flash`).
 
 | Var                | Where to get it                                      |
 | ------------------ | ---------------------------------------------------- |

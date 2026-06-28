@@ -53,7 +53,7 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 
 # Gemini via its OpenAI-compatible endpoint. Override the model if it's retired.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GITHUB_API = "https://api.github.com"
 
@@ -234,6 +234,9 @@ async def call_llm(messages: list[dict], system: str, max_tokens: int = 1024) ->
         "max_tokens": max_tokens,
         # OpenAI-style: system prompt is the first message in the list
         "messages": [{"role": "system", "content": system}, *messages],
+        # Gemini 2.5 models "think" by default, which eats the token budget
+        # before any visible answer. Turn it off so output goes to the reply.
+        "reasoning_effort": "none",
     }
     headers = {
         "Authorization": f"Bearer {GEMINI_API_KEY}",
