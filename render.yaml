@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: second-brain-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
+      - key: ALLOWED_USER_ID
+        sync: false
+      - key: GITHUB_BRANCH
+        value: main
