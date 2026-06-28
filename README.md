@@ -16,6 +16,8 @@ idea → Telegram → pick a mode → Claude develops it → 💾 → GitHub →
 | `/idea`          | Start developing an idea          |
 | `/inbox [text]`  | Quick-save without developing     |
 | `/list`          | Show 10 most recent saved ideas   |
+| `/edit`          | Append a dated update to an idea  |
+| `/delete`        | Remove an idea (with confirm)     |
 
 Drop a raw idea, pick a development mode (🧠 Brain Dump, 🔗 Connect, 🔥 Pressure
 Test, 🚀 Next Steps, or 📥 Quick Save), chat with Claude, then tap 💾 Save,

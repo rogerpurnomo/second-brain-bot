@@ -198,6 +198,19 @@ async def gh_put_file(path: str, content: str, message: str, sha: str | None = N
     resp.raise_for_status()
 
 
+async def gh_delete_file(path: str, sha: str, message: str) -> None:
+    """Delete a file from the vault repo (needs its blob sha)."""
+    payload = {"message": message, "sha": sha, "branch": GITHUB_BRANCH}
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.request(
+            "DELETE",
+            f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{path}",
+            headers=_gh_headers(),
+            json=payload,
+        )
+    resp.raise_for_status()
+
+
 async def gh_list_folder(folder: str) -> list[dict]:
     """List .md files in a vault folder, newest-first by name."""
     async with httpx.AsyncClient(timeout=30) as client:
@@ -321,6 +334,8 @@ WELCOME = (
     "/idea — develop an idea with me\n"
     "/inbox — quick-save without developing\n"
     "/list — show 10 most recent saved ideas\n"
+    "/edit — add an update to an existing idea\n"
+    "/delete — remove an idea\n"
     "/help — this message\n\n"
     "Or just send me any message to start."
 )
@@ -366,6 +381,117 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+def build_idea_list_keyboard(files: list[dict], prefix: str) -> InlineKeyboardMarkup:
+    """One button per idea; callback data is f'{prefix}:{index}' into the list."""
+    rows = [
+        [InlineKeyboardButton(f["name"].removesuffix(".md")[:45], callback_data=f"{prefix}:{i}")]
+        for i, f in enumerate(files)
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    files = (await gh_list_folder("Ideas"))[:10]
+    if not files:
+        await update.message.reply_text("No ideas to delete yet.")
+        return
+    user_state[update.effective_user.id] = {"step": "awaiting_idea", "idea_files": files}
+    await update.message.reply_text(
+        "🗑 Which idea to delete?", reply_markup=build_idea_list_keyboard(files, "del")
+    )
+
+
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    files = (await gh_list_folder("Ideas"))[:10]
+    if not files:
+        await update.message.reply_text("No ideas to edit yet.")
+        return
+    user_state[update.effective_user.id] = {"step": "awaiting_idea", "idea_files": files}
+    await update.message.reply_text(
+        "✏️ Which idea do you want to add to?",
+        reply_markup=build_idea_list_keyboard(files, "ed"),
+    )
+
+
+def _picked_file(uid: int, data: str) -> dict | None:
+    """Resolve a 'prefix:index' callback to the stored file dict, or None if stale."""
+    try:
+        idx = int(data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return None
+    files = user_state.get(uid, {}).get("idea_files") or []
+    return files[idx] if 0 <= idx < len(files) else None
+
+
+async def on_delete_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ALLOWED_USER_ID:
+        return
+    f = _picked_file(query.from_user.id, query.data)
+    if not f:
+        await query.edit_message_text("That list expired — run /delete again.")
+        return
+    name = f["name"].removesuffix(".md")
+    idx = query.data.split(":", 1)[1]
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Yes, delete", callback_data=f"delyes:{idx}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="delcancel"),
+        ]]
+    )
+    await query.edit_message_text(
+        f"Delete *{name}*? This can't be undone.",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def on_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ALLOWED_USER_ID:
+        return
+    f = _picked_file(query.from_user.id, query.data)
+    if not f:
+        await query.edit_message_text("That list expired — run /delete again.")
+        return
+    name = f["name"].removesuffix(".md")
+    await gh_delete_file(f["path"], f["sha"], f"Delete idea: {name}")
+    await query.edit_message_text(f"🗑 Deleted *{name}*", parse_mode=ParseMode.MARKDOWN)
+
+
+async def on_delete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Cancelled — nothing deleted.")
+
+
+async def on_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ALLOWED_USER_ID:
+        return
+    uid = query.from_user.id
+    f = _picked_file(uid, query.data)
+    if not f:
+        await query.edit_message_text("That list expired — run /edit again.")
+        return
+    name = f["name"].removesuffix(".md")
+    user_state[uid] = {
+        "step": "awaiting_edit_text",
+        "edit_target": {"path": f["path"], "name": name},
+    }
+    await query.edit_message_text(
+        f"✏️ Editing *{name}*\nSend the text to add — I'll append it as a dated update.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Message + callback handlers
 # --------------------------------------------------------------------------- #
@@ -375,6 +501,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     uid = update.effective_user.id
     text = update.message.text.strip()
     state = user_state.setdefault(uid, {"step": "awaiting_idea"})
+
+    # Append an update to an existing idea (from /edit)
+    if state.get("step") == "awaiting_edit_text":
+        target = state.get("edit_target")
+        content, sha = (await gh_get_file(target["path"])) if target else (None, None)
+        if content is None:
+            user_state[uid] = {"step": "awaiting_idea"}
+            await update.message.reply_text("That note no longer exists.")
+            return
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        new_content = f"{content.rstrip()}\n\n## Update {date}\n{text}\n"
+        await gh_put_file(target["path"], new_content, f"Update idea: {target['name']}", sha)
+        user_state[uid] = {"step": "awaiting_idea"}
+        await update.message.reply_text(
+            f"✏️ Added your update to *{target['name']}*", parse_mode=ParseMode.MARKDOWN
+        )
+        return
 
     # Quick-save flow triggered by /inbox with no argument
     if state.get("step") == "awaiting_inbox":
@@ -536,8 +679,14 @@ def main() -> None:
     app.add_handler(CommandHandler("idea", cmd_idea))
     app.add_handler(CommandHandler("inbox", cmd_inbox))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CallbackQueryHandler(on_mode, pattern=r"^mode:"))
     app.add_handler(CallbackQueryHandler(on_action, pattern=r"^act:"))
+    app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^delyes:"))
+    app.add_handler(CallbackQueryHandler(on_delete_cancel, pattern=r"^delcancel$"))
+    app.add_handler(CallbackQueryHandler(on_delete_pick, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(on_edit_pick, pattern=r"^ed:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     logger.info("Bot is running...")
