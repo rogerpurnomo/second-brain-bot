@@ -14,7 +14,9 @@ import base64
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 
@@ -495,9 +497,39 @@ async def on_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Health-check server (for platforms like Koyeb that require an open port)
+# --------------------------------------------------------------------------- #
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):  # silence per-request logging
+        pass
+
+
+def start_health_server() -> None:
+    """Serve 200 on the platform-provided $PORT so health checks pass.
+
+    Runs in a daemon thread alongside the polling bot. No-op if it can't bind
+    (e.g. the port is already in use locally) — the bot still runs.
+    """
+    port = int(os.environ.get("PORT", "8000"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    except OSError as exc:
+        logger.warning("Health server not started on :%s (%s)", port, exc)
+        return
+    logger.info("Health server listening on :%s", port)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    start_health_server()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
