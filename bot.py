@@ -100,6 +100,7 @@ How to behave:
 - Be practical: next steps must be doable THIS WEEK.
 - Act proactively but sensibly. Develop an idea when he shares one; when it's solid or he signals he's done, call save_idea without making him ask twice. When something feels related to past work, search_vault and connect it.
 - Don't save on every tiny message — save when there's something worth keeping or he asks.
+- CONNECT IDEAS: before you save_idea, call search_vault (or list_recent_ideas) to find related existing notes, and pass their filenames in `related` so the new note links to them. Always include 2-4 tags too. This weaves a web of connections in his Obsidian graph. (Notes are also auto-linked by shared tags.)
 - Deletes: confirm first; only call delete_idea after he says yes.
 - After you save/update/delete, tell him what you did and the note title.
 - Use his context (AIC, ClearLedge, Martabak, Web3, IDX) when relevant."""
@@ -112,7 +113,8 @@ TOOL_SCHEMAS = [
             "description": (
                 "Save a developed idea as a permanent note in the Ideas folder. "
                 "Use when Roger wants to keep an idea, or after you've developed it "
-                "together and it's worth keeping."
+                "together and it's worth keeping. Always include tags; pass related "
+                "notes so the idea is linked into his vault graph."
             ),
             "parameters": {
                 "type": "object",
@@ -123,8 +125,26 @@ TOOL_SCHEMAS = [
                         "type": "string",
                         "description": "The developed thinking as markdown: key points, structure, insights, next steps",
                     },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "2-4 topic tags, no '#'. Prefer this vocabulary when it fits: "
+                            "aic, clearledge, martabak, web3, idx, investing, ai, ml, data, "
+                            "fintech, product, business — plus specific ones as needed."
+                        ),
+                    },
+                    "related": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Filenames of existing notes this idea relates to (from "
+                            "search_vault / list_recent_ideas), so the new note links to "
+                            "them. Optional — leave empty if you haven't searched."
+                        ),
+                    },
                 },
-                "required": ["title", "raw_idea", "development"],
+                "required": ["title", "raw_idea", "development", "tags"],
             },
         },
     },
@@ -300,13 +320,58 @@ def slugify(text: str) -> str:
     return slug[:60] or "idea"
 
 
-async def save_idea_to_vault(title: str, raw_idea: str, development: str) -> str:
+def normalize_tags(tags) -> list[str]:
+    """Accept a list or a string; return clean, deduped tags (no '#', kebab-case)."""
+    if isinstance(tags, str):
+        tags = re.split(r"[,\s]+", tags)
+    out: list[str] = []
+    for t in tags or []:
+        t = re.sub(r"[^\w-]", "", str(t).strip().lstrip("#").lower().replace(" ", "-"))
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def wikilink_target(name: str) -> str:
+    """Turn a filename/title into the Obsidian [[link]] target (no path, no .md)."""
+    return name.strip().rsplit("/", 1)[-1].removesuffix(".md").strip("[]")
+
+
+def tags_in_note(content: str) -> set[str]:
+    """Parse the '#tags' on a note's 'Tags:' line."""
+    for line in content.splitlines():
+        if line.lower().startswith("tags:"):
+            return {m.lower() for m in re.findall(r"#([\w-]+)", line)}
+    return set()
+
+
+async def find_related_by_tags(tags: list[str], limit: int = 5) -> list[str]:
+    """Find existing Ideas notes that share at least one tag (for auto-linking)."""
+    tagset = set(tags)
+    if not tagset:
+        return []
+    related: list[str] = []
+    for f in (await gh_list_folder("Ideas"))[:25]:
+        content, _ = await gh_get_file(f["path"])
+        if content and tagset & tags_in_note(content):
+            related.append(f["name"].removesuffix(".md"))
+        if len(related) >= limit:
+            break
+    return related
+
+
+async def save_idea_to_vault(
+    title: str, raw_idea: str, development: str, tags=None, related=None
+) -> str:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    tag_line = " ".join(f"#{t}" for t in normalize_tags(tags))
+    targets = list(dict.fromkeys(wikilink_target(r) for r in (related or []) if r))
+    related_block = "\n".join(f"- [[{t}]]" for t in targets)
     note = f"""# {title}
 
 Date: {date}
 Status: #seed
-Tags:
+Tags: {tag_line}
 
 ## The Raw Idea
 {raw_idea}
@@ -318,6 +383,7 @@ Tags:
 - [ ]
 
 ## Related Ideas
+{related_block}
 """
     path = f"Ideas/{date}-{slugify(title)}.md"
     await gh_put_file(path, note, message=f"Add idea: {title}")
@@ -345,9 +411,17 @@ def _norm_filename(name: str) -> str:
     return name if name.endswith(".md") else f"{name}.md"
 
 
-async def tool_save_idea(title: str, raw_idea: str, development: str) -> str:
-    path = await save_idea_to_vault(title, raw_idea, development)
-    return f"Saved as '{title}' at {path}"
+async def tool_save_idea(
+    title: str, raw_idea: str, development: str, tags=None, related=None
+) -> str:
+    tags = normalize_tags(tags)
+    # Relations from two sources: what the agent passed in + automatic tag overlap.
+    model_related = [wikilink_target(r) for r in (related or []) if r]
+    auto_related = await find_related_by_tags(tags)
+    combined = list(dict.fromkeys(model_related + auto_related))
+    path = await save_idea_to_vault(title, raw_idea, development, tags=tags, related=combined)
+    tag_str = " ".join(f"#{t}" for t in tags) or "(none)"
+    return f"Saved '{title}' at {path}. Tags: {tag_str}. Linked to {len(combined)} related note(s)."
 
 
 async def tool_quick_capture(text: str) -> str:
