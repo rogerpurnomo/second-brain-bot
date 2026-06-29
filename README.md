@@ -1,12 +1,17 @@
 # Roger's Second Brain — Telegram Bot
 
-Capture ideas from your phone, develop them with Claude, and save structured
-`.md` notes straight into your Obsidian vault (via a GitHub repo the Obsidian
-Git plugin auto-pulls).
+An autonomous **AI agent** on Telegram. You talk to it in plain language and it
+**decides on its own** when to develop an idea, save it, search your vault,
+connect new ideas to old ones, or update/delete notes — using Gemini
+function-calling. Notes are written as structured `.md` files to your Obsidian
+vault (a GitHub repo the Obsidian Git plugin auto-pulls).
 
 ```
-idea → Telegram → pick a mode → Claude develops it → 💾 → GitHub → Obsidian
+you talk → Gemini agent decides + calls tools → GitHub vault → Obsidian
 ```
+
+The agent's tools: `save_idea`, `quick_capture`, `search_vault`, `read_idea`,
+`list_recent_ideas`, `update_idea`, `delete_idea`. The model picks which to call.
 
 ## Commands
 
@@ -19,9 +24,10 @@ idea → Telegram → pick a mode → Claude develops it → 💾 → GitHub →
 | `/edit`          | Append a dated update to an idea  |
 | `/delete`        | Remove an idea (with confirm)     |
 
-Drop a raw idea, pick a development mode (🧠 Brain Dump, 🔗 Connect, 🔥 Pressure
-Test, 🚀 Next Steps, or 📥 Quick Save), chat with Claude, then tap 💾 Save,
-🔄 Keep going, or ✅ Done.
+Mostly you just chat — no buttons. Say things like *"develop this idea and save
+it"*, *"what have I saved about ClearLedge?"*, or *"delete the parking one"* and
+the agent figures out which tools to call. The slash commands above are optional
+shortcuts (`/delete` and `/edit` still offer button pickers).
 
 ## Tech stack (100% free tier)
 

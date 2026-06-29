@@ -1,16 +1,21 @@
 """
-Roger's Second Brain — Telegram capture + development bot.
+Roger's Second Brain — an autonomous idea-development AGENT on Telegram.
 
-Flow:
-  raw idea -> pick a development mode (inline buttons) -> an LLM develops it
-  with you -> tap 💾 to save a structured .md note to your Obsidian vault repo
-  on GitHub, which the Obsidian Git plugin pulls within ~5 minutes.
+You just talk to it in natural language. Gemini decides, on its own, when to
+call tools — develop an idea, save it, search the vault, connect it to old
+notes, update or delete a note. Notes are written as markdown to an Obsidian
+vault repo on GitHub, which the Obsidian Git plugin pulls within ~5 minutes.
 
-Stateless LLM API, stateful bot: per-user conversation history is held in
-memory and replayed to the model each turn.
+Architecture:
+- Stateful bot, stateless model: per-user conversation history is kept in
+  memory and replayed each turn.
+- Agentic loop: model -> (optional) tool calls -> tool results -> model ...
+  until it returns a final message. The MODEL chooses the tools.
+- Gemini is called via its OpenAI-compatible chat-completions endpoint.
 """
 
 import base64
+import json
 import logging
 import os
 import re
@@ -21,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 
 # Local convenience: load a .env file if python-dotenv is installed.
-# In production (Railway) real env vars are injected, so this is a no-op.
+# In production (Render) real env vars are injected, so this is a no-op.
 try:
     from dotenv import load_dotenv
 
@@ -59,90 +64,152 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GITHUB_API = "https://api.github.com"
 
+MAX_TOOL_ITERATIONS = 6     # safety cap on the agent loop per user turn
+MAX_HISTORY = 24            # messages kept per user before trimming
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("second-brain")
 
-# Per-user state machine. Steps: awaiting_idea -> awaiting_mode -> in_conversation
+# Per-user state: {"step": str, "history": list[dict], "idea_files": ..., "edit_target": ...}
 user_state: dict[int, dict] = {}
 
+
 # --------------------------------------------------------------------------- #
-# Agent personality + modes
+# Agent persona + tool definitions
 # --------------------------------------------------------------------------- #
-SYSTEM_PROMPT = """You are Roger's Second Brain — his idea-development partner.
+AGENT_SYSTEM = """You are Roger's Second Brain — an autonomous idea-development agent living in his Telegram.
 
-About Roger: Data Analytics student at Asia Pacific University (APU), Malaysia.
-ADHD + overthinker — great ideas that pass by fast. Involved in APU AI Club (AIC),
-building ClearLedge (cross-border payment tool), runs Martabak Bangka 66 (food biz).
-Into Web3, investing, Indonesian stocks (IDX), AI/ML, data pipelines.
+About Roger: Data Analytics student at Asia Pacific University (APU), Malaysia. ADHD + overthinker — brilliant ideas that vanish fast. In APU AI Club (AIC), building ClearLedge (cross-border payments), runs Martabak Bangka 66 (food biz). Into Web3, investing, Indonesian stocks (IDX), AI/ML, data pipelines.
 
-Your personality:
-- HIGH ENERGY and hype — match Roger's excitement.
-- Socratic — always end by asking the ONE most important question.
-- Practical — next steps must be doable THIS WEEK, not someday.
-- ADHD-friendly — punchy, scannable, short. No walls of text. Use bullets.
-- You know his context (AIC, ClearLedge, Martabak, Web3, IDX) — use it.
+Your job: help him capture and develop ideas, and manage his vault — and YOU decide when to act using your tools. You don't wait for buttons or explicit commands.
 
-Keep replies tight. Telegram-friendly formatting."""
+Your tools:
+- save_idea — keep a developed idea permanently in the Ideas folder
+- quick_capture — dump a raw thought to the Inbox with no development
+- search_vault / read_idea — find and read existing notes (use these to connect new ideas to old ones)
+- list_recent_ideas — see recent notes
+- update_idea — append to an existing note
+- delete_idea — remove a note (ALWAYS confirm with Roger in your reply BEFORE calling it)
 
-MODES = {
-    "brain_dump": {
-        "label": "🧠 Brain Dump → Structure",
-        "instruction": (
-            "Roger dropped a messy idea. Help him make sense of it. Pull out the "
-            "core insight, structure the moving parts, and reflect it back cleanly. "
-            "Then ask the ONE question that unlocks it most."
-        ),
+How to behave:
+- HIGH ENERGY and hype — match his excitement. ADHD-friendly: punchy, scannable, short. Bullets over paragraphs.
+- Be Socratic: usually end with the ONE most important question.
+- Be practical: next steps must be doable THIS WEEK.
+- Act proactively but sensibly. Develop an idea when he shares one; when it's solid or he signals he's done, call save_idea without making him ask twice. When something feels related to past work, search_vault and connect it.
+- Don't save on every tiny message — save when there's something worth keeping or he asks.
+- Deletes: confirm first; only call delete_idea after he says yes.
+- After you save/update/delete, tell him what you did and the note title.
+- Use his context (AIC, ClearLedge, Martabak, Web3, IDX) when relevant."""
+
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "save_idea",
+            "description": (
+                "Save a developed idea as a permanent note in the Ideas folder. "
+                "Use when Roger wants to keep an idea, or after you've developed it "
+                "together and it's worth keeping."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "A punchy 4-6 word title"},
+                    "raw_idea": {"type": "string", "description": "What Roger originally said, unfiltered"},
+                    "development": {
+                        "type": "string",
+                        "description": "The developed thinking as markdown: key points, structure, insights, next steps",
+                    },
+                },
+                "required": ["title", "raw_idea", "development"],
+            },
+        },
     },
-    "connect": {
-        "label": "🔗 Connect to Existing Ideas",
-        "instruction": (
-            "This idea feels related to things already in Roger's vault. Using the "
-            "recent ideas provided as context, surface the strongest connections and "
-            "what they imply together. Then ask the ONE most important question."
-        ),
+    {
+        "type": "function",
+        "function": {
+            "name": "quick_capture",
+            "description": (
+                "Instantly save a raw thought to the Inbox without developing it. "
+                "Use when Roger says 'just save this', has no time, or wants a quick capture."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
     },
-    "pressure_test": {
-        "label": "🔥 Pressure Test",
-        "instruction": (
-            "Roger is excited about this. Give an honest, high-energy stress-test: "
-            "the strongest version, the real risks, and the fastest way to validate "
-            "it cheaply. Be direct but supportive. End with the ONE question."
-        ),
+    {
+        "type": "function",
+        "function": {
+            "name": "search_vault",
+            "description": (
+                "Search saved notes by keyword to find related or specific ideas. Use to "
+                "connect a new idea to existing ones, or to locate a note before reading/"
+                "updating/deleting it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
     },
-    "next_steps": {
-        "label": "🚀 Next Steps",
-        "instruction": (
-            "This idea is developed enough to act on. Give 3-5 concrete next steps "
-            "Roger can actually do THIS WEEK. Be specific. End with the ONE first "
-            "action to take today."
-        ),
+    {
+        "type": "function",
+        "function": {
+            "name": "list_recent_ideas",
+            "description": "List the filenames of the most recent saved ideas.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
     },
-}
-
-# Inline keyboard shown after a raw idea (📥 quick-save is handled separately)
-MODE_KEYBOARD = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton(MODES["brain_dump"]["label"], callback_data="mode:brain_dump")],
-        [InlineKeyboardButton(MODES["connect"]["label"], callback_data="mode:connect")],
-        [InlineKeyboardButton(MODES["pressure_test"]["label"], callback_data="mode:pressure_test")],
-        [InlineKeyboardButton(MODES["next_steps"]["label"], callback_data="mode:next_steps")],
-        [InlineKeyboardButton("📥 Quick Save to Inbox", callback_data="mode:inbox")],
-    ]
-)
-
-# Inline keyboard shown after Claude replies
-ACTION_KEYBOARD = InlineKeyboardMarkup(
-    [
-        [
-            InlineKeyboardButton("💾 Save", callback_data="act:save"),
-            InlineKeyboardButton("🔄 Keep going", callback_data="act:keep"),
-            InlineKeyboardButton("✅ Done", callback_data="act:done"),
-        ]
-    ]
-)
+    {
+        "type": "function",
+        "function": {
+            "name": "read_idea",
+            "description": "Read the full content of a saved idea by its filename (from search or list).",
+            "parameters": {
+                "type": "object",
+                "properties": {"filename": {"type": "string"}},
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_idea",
+            "description": "Append a dated update to an existing idea note, by filename.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "text": {"type": "string"},
+                },
+                "required": ["filename", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_idea",
+            "description": (
+                "Permanently delete an idea note by filename. ALWAYS ask Roger to confirm "
+                "in your reply BEFORE calling this — never delete without an explicit yes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"filename": {"type": "string"}},
+                "required": ["filename"],
+            },
+        },
+    },
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -227,67 +294,13 @@ async def gh_list_folder(folder: str) -> list[dict]:
     return files
 
 
-async def load_recent_ideas(max_ideas: int = 8) -> str:
-    """Load the last N Ideas as short context snippets for Claude."""
-    files = await gh_list_folder("Ideas")
-    snippets = []
-    for f in files[:max_ideas]:
-        content, _ = await gh_get_file(f["path"])
-        if content:
-            snippets.append(content[:600])
-    if not snippets:
-        return "(No saved ideas yet.)"
-    return "\n\n---\n\n".join(snippets)
-
-
-# --------------------------------------------------------------------------- #
-# LLM brain (Gemini — OpenAI-compatible chat completions, direct HTTP)
-# --------------------------------------------------------------------------- #
-async def call_llm(messages: list[dict], system: str, max_tokens: int = 1024) -> str:
-    payload = {
-        "model": GEMINI_MODEL,
-        "max_tokens": max_tokens,
-        # OpenAI-style: system prompt is the first message in the list
-        "messages": [{"role": "system", "content": system}, *messages],
-        # Gemini 2.5 models "think" by default, which eats the token budget
-        # before any visible answer. Turn it off so output goes to the reply.
-        "reasoning_effort": "none",
-    }
-    headers = {
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
-        "content-type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(GEMINI_URL, headers=headers, json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
-
-
-async def generate_title(raw_idea: str, claude_output: str) -> str:
-    """Ask Claude for a 4-6 word title for the note filename."""
-    prompt = (
-        "Give a 4-6 word title for this idea. Plain text only, no quotes, no "
-        f"punctuation at the end.\n\nIdea: {raw_idea}\n\nDevelopment:\n{claude_output[:1500]}"
-    )
-    title = await call_llm(
-        [{"role": "user", "content": prompt}],
-        system="You write short, punchy note titles.",
-        max_tokens=30,
-    )
-    return title.strip().splitlines()[0].strip().strip('"') or "Untitled Idea"
-
-
-# --------------------------------------------------------------------------- #
-# Saving
-# --------------------------------------------------------------------------- #
 def slugify(text: str) -> str:
     slug = re.sub(r"[^\w\s-]", "", text.lower()).strip()
     slug = re.sub(r"[\s_-]+", "-", slug)
     return slug[:60] or "idea"
 
 
-async def save_idea_to_vault(title: str, raw_idea: str, claude_output: str) -> str:
+async def save_idea_to_vault(title: str, raw_idea: str, development: str) -> str:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     note = f"""# {title}
 
@@ -299,7 +312,7 @@ Tags:
 {raw_idea}
 
 ## AI Session
-{claude_output}
+{development}
 
 ## Next Steps
 - [ ]
@@ -325,34 +338,184 @@ Date: {ts}
 
 
 # --------------------------------------------------------------------------- #
+# Agent tools (the functions the model can call)
+# --------------------------------------------------------------------------- #
+def _norm_filename(name: str) -> str:
+    name = name.strip().rsplit("/", 1)[-1]
+    return name if name.endswith(".md") else f"{name}.md"
+
+
+async def tool_save_idea(title: str, raw_idea: str, development: str) -> str:
+    path = await save_idea_to_vault(title, raw_idea, development)
+    return f"Saved as '{title}' at {path}"
+
+
+async def tool_quick_capture(text: str) -> str:
+    path = await save_to_inbox(text)
+    return f"Quick-captured to {path}"
+
+
+async def tool_list_recent_ideas() -> str:
+    files = await gh_list_folder("Ideas")
+    if not files:
+        return "No ideas saved yet."
+    return "\n".join(f["name"] for f in files[:10])
+
+
+async def tool_search_vault(query: str) -> str:
+    files = await gh_list_folder("Ideas")
+    q = query.lower()
+    hits = []
+    for f in files[:20]:
+        content, _ = await gh_get_file(f["path"])
+        if content and (q in content.lower() or q in f["name"].lower()):
+            line = next((ln for ln in content.splitlines() if q in ln.lower() and ln.strip()), "")
+            hits.append(f"{f['name']}: {line.strip()[:120]}")
+        if len(hits) >= 6:
+            break
+    return "\n".join(hits) if hits else f"No notes matching '{query}'."
+
+
+async def tool_read_idea(filename: str) -> str:
+    content, _ = await gh_get_file(f"Ideas/{_norm_filename(filename)}")
+    return content or f"No note named {filename}."
+
+
+async def tool_update_idea(filename: str, text: str) -> str:
+    path = f"Ideas/{_norm_filename(filename)}"
+    content, sha = await gh_get_file(path)
+    if content is None:
+        return f"No note named {filename}."
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    new_content = f"{content.rstrip()}\n\n## Update {date}\n{text}\n"
+    await gh_put_file(path, new_content, "Update idea (agent)", sha)
+    return f"Appended an update to {path}"
+
+
+async def tool_delete_idea(filename: str) -> str:
+    path = f"Ideas/{_norm_filename(filename)}"
+    _, sha = await gh_get_file(path)
+    if sha is None:
+        return f"No note named {filename}."
+    await gh_delete_file(path, sha, "Delete idea (agent)")
+    return f"Deleted {path}"
+
+
+TOOL_FUNCS = {
+    "save_idea": tool_save_idea,
+    "quick_capture": tool_quick_capture,
+    "search_vault": tool_search_vault,
+    "list_recent_ideas": tool_list_recent_ideas,
+    "read_idea": tool_read_idea,
+    "update_idea": tool_update_idea,
+    "delete_idea": tool_delete_idea,
+}
+
+
+async def dispatch_tool(name: str, args: dict) -> str:
+    func = TOOL_FUNCS.get(name)
+    if func is None:
+        return f"Unknown tool: {name}"
+    try:
+        return await func(**args)
+    except TypeError as exc:
+        return f"Bad arguments for {name}: {exc}"
+    except Exception as exc:  # surface the error to the model so it can recover
+        logger.exception("tool %s failed", name)
+        return f"Error running {name}: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# Gemini (OpenAI-compatible chat completions) + agent loop
+# --------------------------------------------------------------------------- #
+async def _gemini_post(payload: dict) -> dict:
+    headers = {
+        "Authorization": f"Bearer {GEMINI_API_KEY}",
+        "content-type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(GEMINI_URL, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def run_agent(history: list[dict]) -> str:
+    """Run the model->tools->model loop until a final text answer. Mutates history."""
+    for _ in range(MAX_TOOL_ITERATIONS):
+        data = await _gemini_post(
+            {
+                "model": GEMINI_MODEL,
+                "max_tokens": 1500,
+                "messages": [{"role": "system", "content": AGENT_SYSTEM}, *history],
+                "tools": TOOL_SCHEMAS,
+                "tool_choice": "auto",
+                "reasoning_effort": "none",
+            }
+        )
+        msg = data["choices"][0]["message"]
+
+        entry = {"role": "assistant", "content": msg.get("content")}
+        if msg.get("tool_calls"):
+            entry["tool_calls"] = msg["tool_calls"]
+        history.append(entry)
+
+        if not msg.get("tool_calls"):
+            return msg.get("content") or "(no response)"
+
+        for tc in msg["tool_calls"]:
+            try:
+                args = json.loads(tc["function"].get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = await dispatch_tool(tc["function"]["name"], args)
+            history.append(
+                {"role": "tool", "tool_call_id": tc["id"], "content": str(result)}
+            )
+
+    return "I went in circles there — mind rephrasing?"
+
+
+def trim_history(history: list[dict]) -> list[dict]:
+    """Cap history length, cutting at a clean user-message boundary."""
+    if len(history) <= MAX_HISTORY:
+        return history
+    history = history[-MAX_HISTORY:]
+    while history and history[0].get("role") != "user":
+        history.pop(0)
+    return history
+
+
+# --------------------------------------------------------------------------- #
 # Command handlers
 # --------------------------------------------------------------------------- #
 WELCOME = (
     "🧠 *Second Brain online.*\n\n"
-    "Drop an idea and I'll help you develop it before it slips away.\n\n"
-    "*Commands*\n"
-    "/idea — develop an idea with me\n"
-    "/inbox — quick-save without developing\n"
-    "/list — show 10 most recent saved ideas\n"
-    "/edit — add an update to an existing idea\n"
+    "Just talk to me — I'll develop your ideas, connect them to old ones, and "
+    "save/search/update/delete notes on my own as we chat. No buttons needed.\n\n"
+    "Try: _“I want to build a dividend tracker for IDX stocks”_ — or _“what have I "
+    "saved about ClearLedge?”_\n\n"
+    "*Shortcuts*\n"
+    "/inbox — quick-save a raw thought\n"
+    "/list — show recent saved ideas\n"
+    "/edit — add an update to an idea\n"
     "/delete — remove an idea\n"
-    "/help — this message\n\n"
-    "Or just send me any message to start."
+    "/reset — start a fresh conversation\n"
+    "/help — this message"
 )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
-    user_state[update.effective_user.id] = {"step": "awaiting_idea"}
+    user_state[update.effective_user.id] = {"step": "chatting", "history": []}
     await update.message.reply_text(WELCOME, parse_mode=ParseMode.MARKDOWN)
 
 
-async def cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
-    user_state[update.effective_user.id] = {"step": "awaiting_idea"}
-    await update.message.reply_text("💡 Hit me — what's the idea?")
+    user_state[update.effective_user.id] = {"step": "chatting", "history": []}
+    await update.message.reply_text("🧹 Fresh start. What's on your mind?")
 
 
 async def cmd_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,7 +523,7 @@ async def cmd_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = update.message.text.partition(" ")[2].strip()
     if not text:
-        user_state[update.effective_user.id] = {"step": "awaiting_inbox"}
+        user_state.setdefault(update.effective_user.id, {})["step"] = "awaiting_inbox"
         await update.message.reply_text("📥 Send the text to quick-save.")
         return
     path = await save_to_inbox(text)
@@ -376,8 +539,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     lines = ["🗂 *Recent ideas*"]
     for f in files[:10]:
-        name = f["name"].removesuffix(".md")
-        lines.append(f"• {name}")
+        lines.append(f"• {f['name'].removesuffix('.md')}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -397,7 +559,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not files:
         await update.message.reply_text("No ideas to delete yet.")
         return
-    user_state[update.effective_user.id] = {"step": "awaiting_idea", "idea_files": files}
+    user_state.setdefault(update.effective_user.id, {})["idea_files"] = files
     await update.message.reply_text(
         "🗑 Which idea to delete?", reply_markup=build_idea_list_keyboard(files, "del")
     )
@@ -410,7 +572,7 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not files:
         await update.message.reply_text("No ideas to edit yet.")
         return
-    user_state[update.effective_user.id] = {"step": "awaiting_idea", "idea_files": files}
+    user_state.setdefault(update.effective_user.id, {})["idea_files"] = files
     await update.message.reply_text(
         "✏️ Which idea do you want to add to?",
         reply_markup=build_idea_list_keyboard(files, "ed"),
@@ -418,7 +580,6 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _picked_file(uid: int, data: str) -> dict | None:
-    """Resolve a 'prefix:index' callback to the stored file dict, or None if stale."""
     try:
         idx = int(data.split(":", 1)[1])
     except (ValueError, IndexError):
@@ -482,10 +643,9 @@ async def on_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.edit_message_text("That list expired — run /edit again.")
         return
     name = f["name"].removesuffix(".md")
-    user_state[uid] = {
-        "step": "awaiting_edit_text",
-        "edit_target": {"path": f["path"], "name": name},
-    }
+    state = user_state.setdefault(uid, {"step": "chatting", "history": []})
+    state["step"] = "awaiting_edit_text"
+    state["edit_target"] = {"path": f["path"], "name": name}
     await query.edit_message_text(
         f"✏️ Editing *{name}*\nSend the text to add — I'll append it as a dated update.",
         parse_mode=ParseMode.MARKDOWN,
@@ -493,154 +653,62 @@ async def on_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --------------------------------------------------------------------------- #
-# Message + callback handlers
+# Message handler — the agent
 # --------------------------------------------------------------------------- #
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
     uid = update.effective_user.id
     text = update.message.text.strip()
-    state = user_state.setdefault(uid, {"step": "awaiting_idea"})
+    state = user_state.setdefault(uid, {"step": "chatting", "history": []})
+    chat_id = update.effective_chat.id
 
-    # Append an update to an existing idea (from /edit)
+    # /edit follow-up: append the text to the chosen note
     if state.get("step") == "awaiting_edit_text":
         target = state.get("edit_target")
         content, sha = (await gh_get_file(target["path"])) if target else (None, None)
+        state["step"] = "chatting"
         if content is None:
-            user_state[uid] = {"step": "awaiting_idea"}
             await update.message.reply_text("That note no longer exists.")
             return
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         new_content = f"{content.rstrip()}\n\n## Update {date}\n{text}\n"
         await gh_put_file(target["path"], new_content, f"Update idea: {target['name']}", sha)
-        user_state[uid] = {"step": "awaiting_idea"}
         await update.message.reply_text(
             f"✏️ Added your update to *{target['name']}*", parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # Quick-save flow triggered by /inbox with no argument
+    # /inbox follow-up: quick-save
     if state.get("step") == "awaiting_inbox":
+        state["step"] = "chatting"
         path = await save_to_inbox(text)
-        user_state[uid] = {"step": "awaiting_idea"}
         await update.message.reply_text(f"📥 Saved to `{path}`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Continue an in-progress conversation
-    if state.get("step") == "in_conversation":
-        await develop_idea(update, context, uid, user_text=text)
-        return
-
-    # Otherwise this is a fresh raw idea — ask for a mode
-    user_state[uid] = {"step": "awaiting_mode", "raw_idea": text, "history": []}
-    await update.message.reply_text(
-        "Got it. How do you want to work this? 👇", reply_markup=MODE_KEYBOARD
-    )
-
-
-async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ALLOWED_USER_ID:
-        return
-    uid = query.from_user.id
-    mode = query.data.split(":", 1)[1]
-    state = user_state.get(uid)
-    if not state or "raw_idea" not in state:
-        await query.edit_message_text("That idea expired — send it again.")
-        return
-
-    if mode == "inbox":
-        path = await save_to_inbox(state["raw_idea"])
-        user_state[uid] = {"step": "awaiting_idea"}
-        await query.edit_message_text(f"📥 Saved to `{path}`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    state["mode"] = mode
-    state["step"] = "in_conversation"
-    await query.edit_message_text(f"{MODES[mode]['label']} — let's go.")
-    await develop_idea(update, context, uid, user_text=None)
-
-
-async def develop_idea(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, user_text: str | None
-) -> None:
-    state = user_state[uid]
-    chat_id = update.effective_chat.id
+    # Default: hand the message to the agent
+    history = state.setdefault("history", [])
+    history.append({"role": "user", "content": text})
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    history: list[dict] = state["history"]
-
-    # First turn: seed with the raw idea + the chosen mode's instruction
-    if not history:
-        mode = state["mode"]
-        context_block = ""
-        if mode == "connect":
-            recent = await load_recent_ideas()
-            context_block = f"\n\nRecent ideas from Roger's vault:\n{recent}"
-        seed = (
-            f"{MODES[mode]['instruction']}\n\nRoger's raw idea:\n{state['raw_idea']}"
-            f"{context_block}"
+    try:
+        reply = await run_agent(history)
+    except Exception:
+        logger.exception("agent failed")
+        await update.message.reply_text(
+            "⚠️ Something glitched on my end — try again in a sec."
         )
-        history.append({"role": "user", "content": seed})
-    else:
-        history.append({"role": "user", "content": user_text})
-
-    reply = await call_llm(history, system=SYSTEM_PROMPT)
-    history.append({"role": "assistant", "content": reply})
-    state["last_response"] = reply
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=reply,
-        reply_markup=ACTION_KEYBOARD,
-    )
-
-
-async def on_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ALLOWED_USER_ID:
         return
-    uid = query.from_user.id
-    action = query.data.split(":", 1)[1]
-    state = user_state.get(uid)
-    if not state:
-        await query.edit_message_reply_markup(reply_markup=None)
-        return
+    state["history"] = trim_history(history)
+    # Plain text (no Markdown) — the model's free-form output can break TG's parser.
+    await context.bot.send_message(chat_id=chat_id, text=reply or "…")
 
-    if action == "save":
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_chat_action(
-            chat_id=query.message.chat_id, action=ChatAction.TYPING
-        )
-        raw = state.get("raw_idea", "")
-        output = state.get("last_response", "")
-        title = await generate_title(raw, output)
-        path = await save_idea_to_vault(title, raw, output)
-        user_state[uid] = {"step": "awaiting_idea"}
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"💾 Saved *{title}*\n`{path}`\nObsidian will pull it within ~5 min.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
 
-    elif action == "keep":
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(
-            chat_id=query.message.chat_id, text="🔄 Keep going — what's on your mind?"
-        )
-
-    elif action == "done":
-        user_state[uid] = {"step": "awaiting_idea"}
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(
-            chat_id=query.message.chat_id, text="✅ Done. Drop the next one whenever."
-        )
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled error", exc_info=context.error)
 
 
 # --------------------------------------------------------------------------- #
-# Health-check server (for platforms like Koyeb that require an open port)
+# Health-check server (Render/Koyeb require an open port)
 # --------------------------------------------------------------------------- #
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -648,16 +716,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"ok")
 
-    def log_message(self, *args):  # silence per-request logging
+    def log_message(self, *args):
         pass
 
 
 def start_health_server() -> None:
-    """Serve 200 on the platform-provided $PORT so health checks pass.
-
-    Runs in a daemon thread alongside the polling bot. No-op if it can't bind
-    (e.g. the port is already in use locally) — the bot still runs.
-    """
     port = int(os.environ.get("PORT", "8000"))
     try:
         server = HTTPServer(("0.0.0.0", port), _HealthHandler)
@@ -676,18 +739,17 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
-    app.add_handler(CommandHandler("idea", cmd_idea))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("inbox", cmd_inbox))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("edit", cmd_edit))
-    app.add_handler(CallbackQueryHandler(on_mode, pattern=r"^mode:"))
-    app.add_handler(CallbackQueryHandler(on_action, pattern=r"^act:"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^delyes:"))
     app.add_handler(CallbackQueryHandler(on_delete_cancel, pattern=r"^delcancel$"))
     app.add_handler(CallbackQueryHandler(on_delete_pick, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(on_edit_pick, pattern=r"^ed:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
 
     logger.info("Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
